@@ -314,9 +314,6 @@ impl QuinnConnectionDriver {
 
         // Configure transport options
         let mut transport_config = quinn::TransportConfig::default();
-        // Diagnostic: retain several complete FEC frames if the application
-        // receiver cannot drain a fast-send Host burst immediately.
-        transport_config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
         transport_config.max_idle_timeout(
             options
                 .max_idle_timeout
