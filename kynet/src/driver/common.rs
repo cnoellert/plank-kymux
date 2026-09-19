@@ -78,6 +78,9 @@ impl CommonServer {
 
         // Configure transport
         let mut transport_config = quinn::TransportConfig::default();
+        // Diagnostic: retain several complete FEC frames while the fast-send
+        // Host submits a frame burst faster than Quinn's endpoint drains it.
+        transport_config.datagram_send_buffer_size(8 * 1024 * 1024);
         transport_config.max_idle_timeout(
             options
                 .max_idle_timeout
