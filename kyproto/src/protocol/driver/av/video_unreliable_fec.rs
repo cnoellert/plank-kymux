@@ -534,7 +534,7 @@ pub(crate) struct VideoUnreliableFecProtocolRecvDriver {
 }
 
 impl VideoUnreliableFecProtocolRecvDriver {
-    const MAX_BUFFERING: Duration = Duration::from_millis(50);
+    const MAX_BUFFERING: Duration = Duration::from_millis(100);
 
     pub(crate) async fn start(
         mut ky_channel: KyChannel,
