@@ -341,7 +341,9 @@ impl VideoUnreliableFecProtocolSendDriver {
 
         #[cfg(feature = "source-first-fec")]
         if cfg!(target_os = "macos") {
-            return self.send_source_first(&data, max_payload_size, timing).await;
+            return self
+                .send_source_first(&data, max_payload_size, timing)
+                .await;
         }
 
         #[cfg(feature = "sender-timing")]
@@ -392,7 +394,9 @@ impl VideoUnreliableFecProtocolSendDriver {
 
         #[cfg(feature = "sender-timing")]
         if let Some(start) = timing {
-            kynet::sender_timing::update(|m| m.fec_total_ns += kynet::sender_timing::ns(start.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_total_ns += kynet::sender_timing::ns(start.elapsed())
+            });
         }
         Ok(())
     }
@@ -404,11 +408,16 @@ impl VideoUnreliableFecProtocolSendDriver {
         max_payload_size: u16,
         timing: Option<std::time::Instant>,
     ) -> Result<(), ProtocolError> {
-        let config = raptorq::ObjectTransmissionInformation::with_defaults(data.len() as u64, max_payload_size);
+        let config = raptorq::ObjectTransmissionInformation::with_defaults(
+            data.len() as u64,
+            max_payload_size,
+        );
         let sources = super::source_first::source_packets(data, &config);
         let repairs = ((sources.len() as f32 * 0.3).ceil() as u32).max(2);
         if let Some(start) = timing {
-            kynet::sender_timing::update(|m| m.fec_copy_ns += kynet::sender_timing::ns(start.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_copy_ns += kynet::sender_timing::ns(start.elapsed())
+            });
         }
         let oti = config.serialize();
         // All original symbols leave before matrix solving/repair generation.
@@ -419,26 +428,36 @@ impl VideoUnreliableFecProtocolSendDriver {
         let prepare = std::time::Instant::now();
         let encoder = raptorq::Encoder::new(data, config);
         if timing.is_some() {
-            kynet::sender_timing::update(|m| m.fec_encoder_ns += kynet::sender_timing::ns(prepare.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_encoder_ns += kynet::sender_timing::ns(prepare.elapsed())
+            });
         }
         for block in encoder.get_block_encoders() {
             let prepare = std::time::Instant::now();
             let packets = block.repair_packets(0, repairs);
             if timing.is_some() {
-                kynet::sender_timing::update(|m| m.fec_repair_ns += kynet::sender_timing::ns(prepare.elapsed()));
+                kynet::sender_timing::update(|m| {
+                    m.fec_repair_ns += kynet::sender_timing::ns(prepare.elapsed())
+                });
             }
             for packet in packets {
                 self.send_fec_packet(oti, packet).await?;
             }
         }
         if let Some(start) = timing {
-            kynet::sender_timing::update(|m| m.fec_total_ns += kynet::sender_timing::ns(start.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_total_ns += kynet::sender_timing::ns(start.elapsed())
+            });
         }
         Ok(())
     }
 
     #[cfg(feature = "source-first-fec")]
-    async fn send_fec_packet(&self, oti: [u8; 12], packet: raptorq::EncodingPacket) -> Result<(), ProtocolError> {
+    async fn send_fec_packet(
+        &self,
+        oti: [u8; 12],
+        packet: raptorq::EncodingPacket,
+    ) -> Result<(), ProtocolError> {
         let (id, data) = packet.split();
         let mut buf = BytesMut::with_capacity(DATAGRAM_HEADER_SIZE + data.len());
         self.ky_channel.write_datagram_header(&mut buf);
@@ -447,7 +466,10 @@ impl VideoUnreliableFecProtocolSendDriver {
         buf.put_slice(&oti);
         buf.put_slice(&id.serialize());
         buf.put_slice(&data);
-        self.ky_channel.send_datagram(buf.freeze()).await.map_err(ProtocolError::new)
+        self.ky_channel
+            .send_datagram(buf.freeze())
+            .await
+            .map_err(ProtocolError::new)
     }
 }
 
@@ -726,7 +748,9 @@ impl VideoUnreliableFecProtocolRecvDriver {
                                 + fec_stats.missing_source_symbols,
                         );
                         protocol_stats.video_fec_source_symbols_unrecovered = Some(
-                            protocol_stats.video_fec_source_symbols_unrecovered.unwrap_or_default()
+                            protocol_stats
+                                .video_fec_source_symbols_unrecovered
+                                .unwrap_or_default()
                                 + fec_stats.unrecovered_source_symbols,
                         );
                     }
@@ -1138,6 +1162,8 @@ struct DatagramSegments {
     decoder: raptorq::Decoder,
     assembled: Option<Vec<u8>>,
     received_source_symbols: HashSet<(u8, u32)>,
+    received_packets: u64,
+    first_packet_at: Instant,
 }
 
 impl DatagramSegments {
@@ -1148,6 +1174,8 @@ impl DatagramSegments {
             decoder: raptorq::Decoder::new(oti),
             assembled: None,
             received_source_symbols: HashSet::new(),
+            received_packets: 0,
+            first_packet_at: Instant::now(),
         }
     }
 
@@ -1159,6 +1187,7 @@ impl DatagramSegments {
     ) {
         assert!(self.assembled.is_none());
         assert!(oti == self.oti);
+        self.received_packets += 1;
         if Self::is_source_symbol(&oti, &payload_id) {
             self.received_source_symbols.insert((
                 payload_id.source_block_number(),
@@ -1206,13 +1235,29 @@ impl DatagramSegments {
             .div_ceil(u64::from(self.oti.symbol_size()));
         let received_source_symbols = self.received_source_symbols.len() as u64;
         let missing_source_symbols = source_symbols.saturating_sub(received_source_symbols);
+        if !self.is_complete() {
+            eprintln!(
+                "fec_incomplete_object kypacket_seq={} source_symbols={} received_source_symbols={} received_repair_symbols={} received_packets={} age_ms={}",
+                self.kypacket_seq,
+                source_symbols,
+                received_source_symbols,
+                self.received_packets
+                    .saturating_sub(received_source_symbols),
+                self.received_packets,
+                self.first_packet_at.elapsed().as_millis(),
+            );
+        }
         VideoFecStats {
             source_symbols,
             missing_source_symbols,
             // Count only missing originals, never repair packets or all packets
             // in a failed object. An object reconstructed by RaptorQ has no
             // residual loss regardless of how many originals arrived.
-            unrecovered_source_symbols: if self.is_complete() { 0 } else { missing_source_symbols },
+            unrecovered_source_symbols: if self.is_complete() {
+                0
+            } else {
+                missing_source_symbols
+            },
         }
     }
 
@@ -1269,6 +1314,46 @@ mod tests {
         }
 
         (segments.is_complete(), segments.fec_stats())
+    }
+
+    #[test]
+    fn raptorq_recovers_every_progressive_proxy_loss_alignment() {
+        let data: Vec<u8> = (0..312_000 + AVPacketHeader::SERIALIZED_SIZE)
+            .map(|index| ((index * 29 + 7) & 0xff) as u8)
+            .collect();
+        let encoder = raptorq::Encoder::with_defaults(&data, 1280);
+        let oti = encoder.get_config();
+        let source_symbols = data.len().div_ceil(usize::from(oti.symbol_size()));
+        let repair_symbols = ((source_symbols as f32 * 0.3).ceil() as u32).max(2);
+        let packets = encoder
+            .get_encoded_packets(repair_symbols)
+            .into_iter()
+            .map(|packet| {
+                let (payload_id, data) = packet.split();
+                (payload_id, Bytes::from(data))
+            })
+            .collect::<Vec<_>>();
+
+        for (loss_basis_points, alignment_count) in [(300_u64, 100_u64), (500, 20)] {
+            for offset in 0..alignment_count {
+                let mut segments = DatagramSegments::new(7, oti);
+                for (index, (payload_id, data)) in packets.iter().enumerate() {
+                    let sequence = offset + index as u64 + 1;
+                    if (sequence % 10_000) * loss_basis_points % 10_000 < loss_basis_points {
+                        continue;
+                    }
+                    segments.add_packet(oti, payload_id.clone(), data.clone());
+                    if segments.is_complete() {
+                        break;
+                    }
+                }
+                let stats = segments.fec_stats();
+                assert!(
+                    segments.is_complete(),
+                    "RaptorQ did not recover loss_basis_points={loss_basis_points} offset={offset} stats={stats:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1352,6 +1437,9 @@ mod tests {
             "25% loss unexpectedly fit within 30% repair overhead"
         );
         assert!(stats.missing_source_symbols > 0);
-        assert_eq!(stats.unrecovered_source_symbols, stats.missing_source_symbols);
+        assert_eq!(
+            stats.unrecovered_source_symbols,
+            stats.missing_source_symbols
+        );
     }
 }
