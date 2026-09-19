@@ -422,7 +422,12 @@ impl ConnectionDriver for QuinnConnectionDriver {
         }
         #[cfg(feature = "sender-timing")]
         let submit = timing.map(|_| std::time::Instant::now());
-        let result = self.conn.send_datagram(data);
+        // Preserve already queued datagrams when a short producer burst fills
+        // Quinn's buffer. Dropping the oldest datagrams here can remove part
+        // of an in-flight FEC object and turn repairable loss into a whole
+        // missing media frame. The async driver contract can apply bounded
+        // backpressure until Quinn has room.
+        let result = self.conn.send_datagram_wait(data).await;
         #[cfg(feature = "sender-timing")]
         if let (Some(start), Some(submit)) = (timing, submit) {
             let elapsed = crate::sender_timing::ns(submit.elapsed());
