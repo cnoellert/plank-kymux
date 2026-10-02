@@ -264,22 +264,19 @@
 //! packets only after the GOP keyframe is sent. It will depend if we use an
 //! intra-refresh strategy or if we send keyframes often.
 
+use super::fec;
 use crate::ProtocolStats;
-use crate::protocol::driver;
 use crate::protocol::driver::util::seq::Sequencer;
 use crate::protocol::{ProtocolError, ProtocolRecvDriver, ProtocolSendDriver};
 use crate::router::KyChannel;
 use crate::runtime::{self, Instant};
 use crate::task::Task;
 
-use std::{
-    collections::{HashSet, VecDeque},
-    time::Duration,
-};
+use std::{collections::VecDeque, time::Duration};
 
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use kymux_types::av::*;
 use kymux_util::*;
 use kynet::{RecvStream, SendStream};
@@ -341,7 +338,9 @@ impl VideoUnreliableFecProtocolSendDriver {
 
         #[cfg(feature = "source-first-fec")]
         if cfg!(target_os = "macos") {
-            return self.send_source_first(&data, max_payload_size, timing).await;
+            return self
+                .send_source_first(&data, max_payload_size, timing)
+                .await;
         }
 
         #[cfg(feature = "sender-timing")]
@@ -392,7 +391,9 @@ impl VideoUnreliableFecProtocolSendDriver {
 
         #[cfg(feature = "sender-timing")]
         if let Some(start) = timing {
-            kynet::sender_timing::update(|m| m.fec_total_ns += kynet::sender_timing::ns(start.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_total_ns += kynet::sender_timing::ns(start.elapsed())
+            });
         }
         Ok(())
     }
@@ -404,11 +405,16 @@ impl VideoUnreliableFecProtocolSendDriver {
         max_payload_size: u16,
         timing: Option<std::time::Instant>,
     ) -> Result<(), ProtocolError> {
-        let config = raptorq::ObjectTransmissionInformation::with_defaults(data.len() as u64, max_payload_size);
+        let config = raptorq::ObjectTransmissionInformation::with_defaults(
+            data.len() as u64,
+            max_payload_size,
+        );
         let sources = super::source_first::source_packets(data, &config);
         let repairs = ((sources.len() as f32 * 0.3).ceil() as u32).max(2);
         if let Some(start) = timing {
-            kynet::sender_timing::update(|m| m.fec_copy_ns += kynet::sender_timing::ns(start.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_copy_ns += kynet::sender_timing::ns(start.elapsed())
+            });
         }
         let oti = config.serialize();
         // All original symbols leave before matrix solving/repair generation.
@@ -419,26 +425,36 @@ impl VideoUnreliableFecProtocolSendDriver {
         let prepare = std::time::Instant::now();
         let encoder = raptorq::Encoder::new(data, config);
         if timing.is_some() {
-            kynet::sender_timing::update(|m| m.fec_encoder_ns += kynet::sender_timing::ns(prepare.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_encoder_ns += kynet::sender_timing::ns(prepare.elapsed())
+            });
         }
         for block in encoder.get_block_encoders() {
             let prepare = std::time::Instant::now();
             let packets = block.repair_packets(0, repairs);
             if timing.is_some() {
-                kynet::sender_timing::update(|m| m.fec_repair_ns += kynet::sender_timing::ns(prepare.elapsed()));
+                kynet::sender_timing::update(|m| {
+                    m.fec_repair_ns += kynet::sender_timing::ns(prepare.elapsed())
+                });
             }
             for packet in packets {
                 self.send_fec_packet(oti, packet).await?;
             }
         }
         if let Some(start) = timing {
-            kynet::sender_timing::update(|m| m.fec_total_ns += kynet::sender_timing::ns(start.elapsed()));
+            kynet::sender_timing::update(|m| {
+                m.fec_total_ns += kynet::sender_timing::ns(start.elapsed())
+            });
         }
         Ok(())
     }
 
     #[cfg(feature = "source-first-fec")]
-    async fn send_fec_packet(&self, oti: [u8; 12], packet: raptorq::EncodingPacket) -> Result<(), ProtocolError> {
+    async fn send_fec_packet(
+        &self,
+        oti: [u8; 12],
+        packet: raptorq::EncodingPacket,
+    ) -> Result<(), ProtocolError> {
         let (id, data) = packet.split();
         let mut buf = BytesMut::with_capacity(DATAGRAM_HEADER_SIZE + data.len());
         self.ky_channel.write_datagram_header(&mut buf);
@@ -447,7 +463,10 @@ impl VideoUnreliableFecProtocolSendDriver {
         buf.put_slice(&oti);
         buf.put_slice(&id.serialize());
         buf.put_slice(&data);
-        self.ky_channel.send_datagram(buf.freeze()).await.map_err(ProtocolError::new)
+        self.ky_channel
+            .send_datagram(buf.freeze())
+            .await
+            .map_err(ProtocolError::new)
     }
 }
 
@@ -526,8 +545,25 @@ struct DatagramMsg {
     payload_id: raptorq::PayloadId,
 }
 
+impl DatagramMsg {
+    fn parse(datagram: Bytes) -> Result<Self, ProtocolError> {
+        let (data, oti, payload_id) = fec::parse_datagram(
+            datagram.clone(),
+            DATAGRAM_HEADER_SIZE,
+            fec::MAX_VIDEO_PAYLOAD,
+        )?;
+        Ok(Self {
+            raw_kypacket_seq: BigEndian::read_u32(&datagram[2..6]),
+            raw_group_seq: BigEndian::read_u32(&datagram[6..10]),
+            data,
+            oti,
+            payload_id,
+        })
+    }
+}
+
 pub(crate) struct VideoUnreliableFecProtocolRecvDriver {
-    rx_client: mpsc::Receiver<AVPacket>,
+    rx_client: mpsc::Receiver<Result<AVPacket, ProtocolError>>,
     recv_stream_packets_task: Option<Task>,
     recv_datagrams_task: Option<Task>,
     process_task: Option<Task>,
@@ -548,18 +584,18 @@ impl VideoUnreliableFecProtocolRecvDriver {
         let tx2 = tx.clone();
         let recv_stream_packets_task = Task::spawn_task(
             async move {
-                let ret = Self::recv_stream_packets(stream, tx2).await;
+                let ret = Self::recv_stream_packets(stream, tx2.clone()).await;
                 if let Err(err) = ret {
-                    error!("recv_stream_packets() error: {err}");
+                    let _ = tx2.send(Err(err)).await;
                 }
             },
             "recv_stream_packets",
         );
         let recv_datagrams_task = Task::spawn_task(
             async move {
-                let ret = Self::recv_datagrams(ky_channel, tx).await;
+                let ret = Self::recv_datagrams(ky_channel, tx.clone()).await;
                 if let Err(err) = ret {
-                    error!("recv_datagrams() error: {err}");
+                    let _ = tx.send(Err(err)).await;
                 }
             },
             "recv_datagrams",
@@ -568,9 +604,9 @@ impl VideoUnreliableFecProtocolRecvDriver {
         let protocol_stats = protocol_stats.clone();
         let process_task = Task::spawn_task(
             async move {
-                let ret = Self::process(rx, tx_client, protocol_stats).await;
+                let ret = Self::process(rx, tx_client.clone(), protocol_stats).await;
                 if let Err(err) = ret {
-                    error!("process() error: {err}");
+                    let _ = tx_client.send(Err(err)).await;
                 }
             },
             "process",
@@ -586,7 +622,7 @@ impl VideoUnreliableFecProtocolRecvDriver {
 
     async fn recv_stream_packets(
         mut stream: RecvStream,
-        tx: mpsc::Sender<RecvMsg>,
+        tx: mpsc::Sender<Result<RecvMsg, ProtocolError>>,
     ) -> Result<(), ProtocolError> {
         loop {
             let mut seqs = [0; 8];
@@ -597,15 +633,13 @@ impl VideoUnreliableFecProtocolRecvDriver {
             let raw_kypacket_seq = BigEndian::read_u32(&seqs[..4]);
             let raw_group_seq = BigEndian::read_u32(&seqs[4..]);
 
-            let packet = driver::read_packet(&mut stream)
-                .await?
-                .ok_or_else(|| ProtocolError("Missing packet data on stream".to_string()))?;
+            let packet = fec::read_stream_packet(&mut stream, fec::MAX_VIDEO_PAYLOAD).await?;
 
-            tx.send(RecvMsg::Stream(StreamMsg {
+            tx.send(Ok(RecvMsg::Stream(StreamMsg {
                 packet,
                 raw_kypacket_seq,
                 raw_group_seq,
-            }))
+            })))
             .await
             .map_err(ProtocolError::new)?;
         }
@@ -613,41 +647,22 @@ impl VideoUnreliableFecProtocolRecvDriver {
 
     async fn recv_datagrams(
         mut ky_channel: KyChannel,
-        tx: mpsc::Sender<RecvMsg>,
+        tx: mpsc::Sender<Result<RecvMsg, ProtocolError>>,
     ) -> Result<(), ProtocolError> {
         loop {
-            let mut datagram = ky_channel
+            let datagram = ky_channel
                 .recv_datagram()
                 .await
                 .map_err(ProtocolError::new)?;
-            assert!(datagram.len() >= DATAGRAM_HEADER_SIZE);
-            let _endpoint_id = datagram.get_u16();
-            let raw_kypacket_seq = datagram.get_u32();
-            let raw_group_seq = datagram.get_u32();
-
-            let mut oti = [0; 12];
-            datagram.copy_to_slice(&mut oti);
-            let oti = raptorq::ObjectTransmissionInformation::deserialize(&oti);
-
-            let mut payload_id = [0; 4];
-            datagram.copy_to_slice(&mut payload_id);
-            let payload_id = raptorq::PayloadId::deserialize(&payload_id);
-
-            tx.send(RecvMsg::Datagram(DatagramMsg {
-                data: datagram,
-                raw_kypacket_seq,
-                raw_group_seq,
-                oti,
-                payload_id,
-            }))
-            .await
-            .map_err(ProtocolError::new)?;
+            tx.send(Ok(RecvMsg::Datagram(DatagramMsg::parse(datagram)?)))
+                .await
+                .map_err(ProtocolError::new)?;
         }
     }
 
     async fn process(
-        mut rx: mpsc::Receiver<RecvMsg>,
-        mut tx_client: mpsc::Sender<AVPacket>,
+        mut rx: mpsc::Receiver<Result<RecvMsg, ProtocolError>>,
+        tx_client: mpsc::Sender<Result<AVPacket, ProtocolError>>,
         protocol_stats: KyArc<KyMutex<ProtocolStats>>,
     ) -> Result<(), ProtocolError> {
         let mut group_sequencer = Sequencer::<u32>::new();
@@ -659,11 +674,11 @@ impl VideoUnreliableFecProtocolRecvDriver {
         loop {
             tokio::select! {
                 msg = rx.recv() => {
-                    match msg {
+                    match msg.transpose()? {
                         Some(RecvMsg::Stream(msg)) => {
                             if let AVPacket::Codec(packet) = &msg.packet {
                                 debug!("===== SEND codec packet to client");
-                                tx_client.send(msg.packet).await.map_err(ProtocolError::new)?;
+                                tx_client.send(Ok(msg.packet)).await.map_err(ProtocolError::new)?;
                                 continue;
                             }
 
@@ -671,7 +686,7 @@ impl VideoUnreliableFecProtocolRecvDriver {
                             let group_seq = group_sequencer.seq(msg.raw_group_seq);
 
                             if kypacket_seq >= next_kypacket_seq {
-                                pending_groups.insert_stream_packet(group_seq, kypacket_seq, msg.packet);
+                                pending_groups.insert_stream_packet(group_seq, kypacket_seq, msg.packet)?;
                             }
                         }
                         Some(RecvMsg::Datagram(msg)) => {
@@ -685,7 +700,7 @@ impl VideoUnreliableFecProtocolRecvDriver {
                             }
 
                             debug!("===== RECV datagram {}:{:?}", kypacket_seq, msg.payload_id);
-                            pending_groups.insert_datagram(group_seq, kypacket_seq, msg.oti, msg.payload_id, msg.data);
+                            pending_groups.insert_datagram(group_seq, kypacket_seq, msg.oti, msg.payload_id, msg.data)?;
                         }
                         None => return Ok(()), // No more data
                     }
@@ -726,7 +741,9 @@ impl VideoUnreliableFecProtocolRecvDriver {
                                 + fec_stats.missing_source_symbols,
                         );
                         protocol_stats.video_fec_source_symbols_unrecovered = Some(
-                            protocol_stats.video_fec_source_symbols_unrecovered.unwrap_or_default()
+                            protocol_stats
+                                .video_fec_source_symbols_unrecovered
+                                .unwrap_or_default()
                                 + fec_stats.unrecovered_source_symbols,
                         );
                     }
@@ -749,7 +766,10 @@ impl VideoUnreliableFecProtocolRecvDriver {
                         }
                     }
                     next_kypacket_seq = kypacket_seq + 1;
-                    tx_client.send(packet).await.map_err(ProtocolError::new)?;
+                    tx_client
+                        .send(Ok(packet))
+                        .await
+                        .map_err(ProtocolError::new)?;
                     deadline = None;
                 }
             }
@@ -777,12 +797,26 @@ impl ProtocolRecvDriver for VideoUnreliableFecProtocolRecvDriver {
     type Packet = AVPacket;
 
     async fn recv(&mut self) -> Result<Option<AVPacket>, ProtocolError> {
-        Ok(self.rx_client.recv().await)
+        let result = self.rx_client.recv().await.transpose();
+        if result.is_err() {
+            // A malformed peer must not leave companion readers half alive.
+            if let Some(task) = self.recv_stream_packets_task.take() {
+                task.cancel();
+            }
+            if let Some(task) = self.recv_datagrams_task.take() {
+                task.cancel();
+            }
+            if let Some(task) = self.process_task.take() {
+                task.cancel();
+            }
+        }
+        result
     }
 }
 
 #[derive(Debug)]
 struct DatagramPacket {
+    oti: raptorq::ObjectTransmissionInformation,
     packet: AVPacket,
     kypacket_seq: u64,
     instant: Instant, // assemble() timestamp
@@ -869,39 +903,132 @@ impl ConfigPacket {
 #[derive(Debug)]
 struct PendingGroups {
     pending_groups: Vec<PendingGroup>,
+    /// The highest sequence retired at the budget; later symbols for it or
+    /// anything older are ignored.
+    retired_through: Option<u64>,
+    /// FEC accounting for retired objects, reported with the next packet.
+    retired_stats: VideoFecStats,
 }
 
 impl PendingGroups {
     fn new() -> Self {
         Self {
             pending_groups: Vec::new(),
+            retired_through: None,
+            retired_stats: VideoFecStats::default(),
         }
     }
 
-    fn prepare_pending_group(&mut self, group_seq: u64) -> usize {
+    fn prepare_pending_group(&mut self, group_seq: u64) -> Result<usize, ProtocolError> {
         let index = self
             .pending_groups
             .binary_search_by_key(&group_seq, |pending_group| pending_group.group_seq);
 
         match index {
-            Ok(index) => index,
+            Ok(index) => Ok(index),
             Err(index) => {
+                if self.pending_groups.len() >= fec::MAX_PENDING_GROUPS {
+                    return Err(fec::invalid("too many pending video groups"));
+                }
                 let pending_group = PendingGroup::new(group_seq);
                 self.pending_groups.insert(index, pending_group);
-                index
+                Ok(index)
             }
         }
     }
 
-    fn insert_stream_packet(&mut self, group_seq: u64, kypacket_seq: u64, packet: AVPacket) {
-        let index = self.prepare_pending_group(group_seq);
+    /// Admits one more pending object. While nothing can be forwarded (for
+    /// example, a group's config is delayed on the reliable stream) pending
+    /// video otherwise grows until the budget ends the stream. At the budget,
+    /// media that has waited longer than the reorder window is obsolete: the
+    /// oldest is retired as lost, oldest first, so the stream can recover. A
+    /// burst of fresh objects that alone exceeds the budget is still rejected.
+    fn admit(&mut self, additional: usize) -> Result<(), ProtocolError> {
+        let now = Instant::now();
+        loop {
+            let error = match self.check_capacity(additional) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            if !self.retire_oldest_media(now) {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Retires the pending media object with the lowest sequence if it is
+    /// stale. Configs are never retired, so media still cannot be forwarded
+    /// before its config.
+    fn retire_oldest_media(&mut self, now: Instant) -> bool {
+        let mut oldest: Option<(usize, bool, u64, Instant)> = None;
+        for (index, group) in self.pending_groups.iter().enumerate() {
+            let segment = group
+                .segments
+                .first()
+                .map(|s| (false, s.kypacket_seq, s.created));
+            let datagram = group
+                .datagrams
+                .front()
+                .map(|d| (true, d.kypacket_seq, d.instant));
+            for (is_datagram, seq, instant) in segment.into_iter().chain(datagram) {
+                if oldest.is_none_or(|(_, _, oldest_seq, _)| seq < oldest_seq) {
+                    oldest = Some((index, is_datagram, seq, instant));
+                }
+            }
+        }
+        let Some((index, is_datagram, seq, instant)) = oldest else {
+            return false;
+        };
+        if instant + VideoUnreliableFecProtocolRecvDriver::MAX_BUFFERING > now {
+            return false;
+        }
+        let group = &mut self.pending_groups[index];
+        let stats = if is_datagram {
+            group.datagrams.pop_front().map(|d| d.fec_stats)
+        } else {
+            Some(group.segments.remove(0).fec_stats())
+        };
+        self.retired_stats.accumulate(stats.unwrap_or_default());
+        self.retired_through = Some(self.retired_through.map_or(seq, |retired| retired.max(seq)));
+        if group.config_packet.is_none() && group.segments.is_empty() && group.datagrams.is_empty()
+        {
+            self.pending_groups.remove(index);
+        }
+        true
+    }
+
+    fn check_capacity(&self, additional: usize) -> Result<(), ProtocolError> {
+        let (objects, bytes) = self.pending_groups.iter().fold((0, 0), |(n, b), group| {
+            let (count, charge) = group.usage();
+            (n + count, b + charge)
+        });
+        fec::check_pending(objects, bytes, additional, fec::MAX_VIDEO_PAYLOAD)
+    }
+
+    fn insert_stream_packet(
+        &mut self,
+        group_seq: u64,
+        kypacket_seq: u64,
+        packet: AVPacket,
+    ) -> Result<(), ProtocolError> {
+        let AVPacket::Media(media) = &packet else {
+            return Err(fec::invalid("expected video config"));
+        };
+        if !media.header.is_config {
+            return Err(fec::invalid("expected video config"));
+        }
+        self.admit(media.payload.len())?;
+        let index = self.prepare_pending_group(group_seq)?;
 
         let pending_group = &mut self.pending_groups[index];
-        assert!(pending_group.config_packet.is_none());
+        if !pending_group.config_packet.is_none() {
+            return Err(fec::invalid("duplicate video group config"));
+        }
         pending_group.config_packet = ConfigPacket::Ready(StreamPacket {
             packet,
             kypacket_seq,
         });
+        Ok(())
     }
 
     fn insert_datagram(
@@ -911,11 +1038,28 @@ impl PendingGroups {
         oti: raptorq::ObjectTransmissionInformation,
         payload_id: raptorq::PayloadId,
         data: Bytes,
-    ) {
-        let index = self.prepare_pending_group(group_seq);
+    ) -> Result<(), ProtocolError> {
+        fec::validate_oti(&oti, fec::MAX_VIDEO_PAYLOAD)?;
+        if self
+            .retired_through
+            .is_some_and(|retired| kypacket_seq <= retired)
+        {
+            // Late symbols of video already accounted as lost.
+            return Ok(());
+        }
+        // The packet sequence cannot migrate between video config groups.
+        for group in &self.pending_groups {
+            if group.group_seq != group_seq && group.contains(kypacket_seq) {
+                return Err(fec::invalid("object changed video group"));
+            }
+        }
+        let index = self.prepare_pending_group(group_seq)?;
+        if !self.pending_groups[index].contains(kypacket_seq) {
+            self.admit(fec::reservation(&oti))?;
+        }
 
         let pending_group = &mut self.pending_groups[index];
-        pending_group.insert_datagram(kypacket_seq, oti, payload_id, data);
+        pending_group.insert_datagram(kypacket_seq, oti, payload_id, data)
     }
 
     fn next_packet(&self, next_kypacket_seq: u64) -> NextPacket {
@@ -994,7 +1138,7 @@ impl PendingGroups {
             NextPacket::None => Action::None,
             NextPacket::Deadline(instant) => Action::Deadline(instant),
             NextPacket::Ready(packet_ref) => {
-                let mut fec_stats = VideoFecStats::default();
+                let mut fec_stats = std::mem::take(&mut self.retired_stats);
                 if packet_ref.pending_group_index > 0 {
                     for pending_group in self.pending_groups.drain(..packet_ref.pending_group_index)
                     {
@@ -1042,6 +1186,38 @@ struct PendingGroup {
 }
 
 impl PendingGroup {
+    fn contains(&self, seq: u64) -> bool {
+        self.segments
+            .binary_search_by_key(&seq, |s| s.kypacket_seq)
+            .is_ok()
+            || self
+                .datagrams
+                .binary_search_by_key(&seq, |d| d.kypacket_seq)
+                .is_ok()
+    }
+
+    fn usage(&self) -> (usize, usize) {
+        let mut objects = self.segments.len() + self.datagrams.len();
+        let mut bytes = self
+            .segments
+            .iter()
+            .map(|s| fec::reservation(&s.decoder.oti))
+            .sum::<usize>()
+            + self
+                .datagrams
+                .iter()
+                .map(|d| fec::reservation(&d.oti))
+                .sum::<usize>();
+        if let ConfigPacket::Ready(StreamPacket {
+            packet: AVPacket::Media(media),
+            ..
+        }) = &self.config_packet
+        {
+            objects += 1;
+            bytes += media.payload.len();
+        }
+        (objects, bytes)
+    }
     fn new(group_seq: u64) -> Self {
         Self {
             group_seq,
@@ -1057,42 +1233,45 @@ impl PendingGroup {
         oti: raptorq::ObjectTransmissionInformation,
         payload_id: raptorq::PayloadId,
         data: Bytes,
-    ) {
+    ) -> Result<(), ProtocolError> {
         let index = self
             .datagrams
             .binary_search_by_key(&kypacket_seq, |datagram| datagram.kypacket_seq);
         // If the kypacket having this kypacket_seq is not already re-assembled
         if index.is_err() {
-            let index = self.prepare_datagram_segments(kypacket_seq, oti);
+            let index = self.prepare_datagram_segments(kypacket_seq, oti)?;
 
             let is_complete = {
                 let segments = &mut self.segments[index];
-                segments.add_packet(oti, payload_id, data);
+                segments.add_packet(oti, payload_id, data)?;
                 segments.is_complete()
             };
 
             if is_complete {
                 let segments = self.segments.remove(index);
-                let datagram_packet = segments.assemble();
+                let datagram_packet = segments.assemble()?;
                 self.insert_datagram_packet(datagram_packet);
             }
+        } else if self.datagrams[index.unwrap()].oti != oti {
+            return Err(fec::invalid("OTI changed for completed video object"));
         }
+        Ok(())
     }
 
     fn prepare_datagram_segments(
         &mut self,
         kypacket_seq: u64,
         oti: raptorq::ObjectTransmissionInformation,
-    ) -> usize {
+    ) -> Result<usize, ProtocolError> {
         let index = self
             .segments
             .binary_search_by_key(&kypacket_seq, |segments| segments.kypacket_seq);
         match index {
-            Ok(index) => index,
+            Ok(index) => Ok(index),
             Err(index) => {
-                let segments = DatagramSegments::new(kypacket_seq, oti);
+                let segments = DatagramSegments::new(kypacket_seq, oti)?;
                 self.segments.insert(index, segments);
-                index
+                Ok(index)
             }
         }
     }
@@ -1134,21 +1313,22 @@ impl PendingGroup {
 #[derive(Debug)]
 struct DatagramSegments {
     kypacket_seq: u64,
-    oti: raptorq::ObjectTransmissionInformation,
-    decoder: raptorq::Decoder,
+    decoder: fec::ObjectDecoder,
     assembled: Option<Vec<u8>>,
-    received_source_symbols: HashSet<(u8, u32)>,
+    created: Instant, // first symbol received
 }
 
 impl DatagramSegments {
-    fn new(kypacket_seq: u64, oti: raptorq::ObjectTransmissionInformation) -> Self {
-        Self {
+    fn new(
+        kypacket_seq: u64,
+        oti: raptorq::ObjectTransmissionInformation,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self {
             kypacket_seq,
-            oti,
-            decoder: raptorq::Decoder::new(oti),
+            decoder: fec::ObjectDecoder::new(oti, fec::MAX_VIDEO_PAYLOAD)?,
             assembled: None,
-            received_source_symbols: HashSet::new(),
-        }
+            created: Instant::now(),
+        })
     }
 
     fn add_packet(
@@ -1156,55 +1336,22 @@ impl DatagramSegments {
         oti: raptorq::ObjectTransmissionInformation,
         payload_id: raptorq::PayloadId,
         data: Bytes,
-    ) {
-        assert!(self.assembled.is_none());
-        assert!(oti == self.oti);
-        if Self::is_source_symbol(&oti, &payload_id) {
-            self.received_source_symbols.insert((
-                payload_id.source_block_number(),
-                payload_id.encoding_symbol_id(),
-            ));
-        }
-        let encoding_packet = raptorq::EncodingPacket::new(payload_id, data.into());
-        self.assembled = self.decoder.decode(encoding_packet);
+    ) -> Result<(), ProtocolError> {
+        self.assembled = self.decoder.decode(oti, payload_id, data)?;
+        Ok(())
     }
 
     fn is_complete(&self) -> bool {
         self.assembled.is_some()
     }
 
-    fn source_symbols_for_block(
-        oti: &raptorq::ObjectTransmissionInformation,
-        source_block_number: u8,
-    ) -> u32 {
-        let source_symbols = oti.transfer_length().div_ceil(u64::from(oti.symbol_size()));
-        let source_symbols =
-            u32::try_from(source_symbols).expect("RaptorQ source-symbol count must fit in u32");
-        let (large, small, large_blocks, small_blocks) =
-            raptorq::partition(source_symbols, u32::from(oti.source_blocks()));
-        let source_block_number = u32::from(source_block_number);
-        assert!(source_block_number < large_blocks + small_blocks);
-        if source_block_number < large_blocks {
-            large
-        } else {
-            small
-        }
-    }
-
-    fn is_source_symbol(
-        oti: &raptorq::ObjectTransmissionInformation,
-        payload_id: &raptorq::PayloadId,
-    ) -> bool {
-        payload_id.encoding_symbol_id()
-            < Self::source_symbols_for_block(oti, payload_id.source_block_number())
-    }
-
     fn fec_stats(&self) -> VideoFecStats {
         let source_symbols = self
+            .decoder
             .oti
             .transfer_length()
-            .div_ceil(u64::from(self.oti.symbol_size()));
-        let received_source_symbols = self.received_source_symbols.len() as u64;
+            .div_ceil(u64::from(self.decoder.oti.symbol_size()));
+        let received_source_symbols = self.decoder.received_sources;
         let missing_source_symbols = source_symbols.saturating_sub(received_source_symbols);
         VideoFecStats {
             source_symbols,
@@ -1212,29 +1359,28 @@ impl DatagramSegments {
             // Count only missing originals, never repair packets or all packets
             // in a failed object. An object reconstructed by RaptorQ has no
             // residual loss regardless of how many originals arrived.
-            unrecovered_source_symbols: if self.is_complete() { 0 } else { missing_source_symbols },
+            unrecovered_source_symbols: if self.is_complete() {
+                0
+            } else {
+                missing_source_symbols
+            },
         }
     }
 
-    fn assemble(self) -> DatagramPacket {
-        assert!(self.is_complete());
+    fn assemble(self) -> Result<DatagramPacket, ProtocolError> {
         let fec_stats = self.fec_stats();
-        let data = self.assembled.unwrap();
+        let data = self
+            .assembled
+            .ok_or_else(|| fec::invalid("incomplete video object"))?;
+        let packet = fec::media_packet(data)?;
 
-        // TODO for now, the kypacket header is sent "as is" over datagrams.
-        // In the future, they might be rewritten (we don't need the same data,
-        // for example size is redundant)
-        let header = MediaPacketHeader::deserialize(&data[..AVPacketHeader::SERIALIZED_SIZE]);
-
-        let payload = Bytes::from(data).slice(AVPacketHeader::SERIALIZED_SIZE..);
-        let packet = AVPacket::Media(MediaPacket { header, payload });
-
-        DatagramPacket {
+        Ok(DatagramPacket {
+            oti: self.decoder.oti,
             packet,
             kypacket_seq: self.kypacket_seq,
             instant: Instant::now(),
             fec_stats,
-        }
+        })
     }
 }
 
@@ -1255,14 +1401,16 @@ mod tests {
         let source_symbols = data.len().div_ceil(usize::from(oti.symbol_size()));
         let repair_symbols = ((source_symbols as f32 * 0.3).ceil() as u32).max(2);
         let packets = encoder.get_encoded_packets(repair_symbols);
-        let mut segments = DatagramSegments::new(7, oti);
+        let mut segments = DatagramSegments::new(7, oti).unwrap();
 
         for (index, packet) in packets.into_iter().enumerate() {
             if evenly_drop_packet(index, loss_percent) {
                 continue;
             }
             let (payload_id, data) = packet.split();
-            segments.add_packet(oti, payload_id, Bytes::from(data));
+            segments
+                .add_packet(oti, payload_id, Bytes::from(data))
+                .unwrap();
             if segments.is_complete() {
                 break;
             }
@@ -1275,25 +1423,9 @@ mod tests {
     fn identifies_source_symbols_in_each_raptorq_block() {
         let oti = raptorq::ObjectTransmissionInformation::new(10 * 1280, 1280, 3, 1, 8);
 
-        assert_eq!(DatagramSegments::source_symbols_for_block(&oti, 0), 4);
-        assert_eq!(DatagramSegments::source_symbols_for_block(&oti, 1), 3);
-        assert_eq!(DatagramSegments::source_symbols_for_block(&oti, 2), 3);
-        assert!(DatagramSegments::is_source_symbol(
-            &oti,
-            &raptorq::PayloadId::new(0, 3),
-        ));
-        assert!(!DatagramSegments::is_source_symbol(
-            &oti,
-            &raptorq::PayloadId::new(0, 4),
-        ));
-        assert!(DatagramSegments::is_source_symbol(
-            &oti,
-            &raptorq::PayloadId::new(2, 2),
-        ));
-        assert!(!DatagramSegments::is_source_symbol(
-            &oti,
-            &raptorq::PayloadId::new(2, 3),
-        ));
+        assert_eq!(fec::source_symbols_for_block(&oti, 0), 4);
+        assert_eq!(fec::source_symbols_for_block(&oti, 1), 3);
+        assert_eq!(fec::source_symbols_for_block(&oti, 2), 3);
     }
 
     #[test]
@@ -1305,7 +1437,9 @@ mod tests {
         let (id, bytes) = packet.split();
         let mut group = PendingGroup::new(1);
         for _ in 0..3 {
-            group.insert_datagram(7, oti, id.clone(), Bytes::copy_from_slice(&bytes));
+            group
+                .insert_datagram(7, oti, id.clone(), Bytes::copy_from_slice(&bytes))
+                .unwrap();
         }
         assert_eq!(group.drop_expired_segments(7).source_symbols, 0);
         let expired = group.drop_expired_segments(8);
@@ -1324,7 +1458,9 @@ mod tests {
         let mut group = PendingGroup::new(1);
         for packet in encoder.get_encoded_packets(0).into_iter().take(5) {
             let (id, bytes) = packet.split();
-            group.insert_datagram(42, oti, id, Bytes::from(bytes));
+            group
+                .insert_datagram(42, oti, id, Bytes::from(bytes))
+                .unwrap();
         }
         let stats = group.discarded_fec_stats();
         assert_eq!(stats.source_symbols, 20); // No guessed sizes for sequence gaps.
@@ -1352,6 +1488,149 @@ mod tests {
             "25% loss unexpectedly fit within 30% repair overhead"
         );
         assert!(stats.missing_source_symbols > 0);
-        assert_eq!(stats.unrecovered_source_symbols, stats.missing_source_symbols);
+        assert_eq!(
+            stats.unrecovered_source_symbols,
+            stats.missing_source_symbols
+        );
+    }
+
+    /// Valid frame bytes whose pts is its kypacket sequence, so the client side
+    /// of the test can tell exactly which frames were forwarded.
+    fn frame_bytes(seq: u32) -> Vec<u8> {
+        let size = 4000;
+        let header = MediaPacketHeader {
+            is_config: false,
+            is_key: false,
+            pts: u64::from(seq),
+            size,
+        };
+        let mut data = header.serialize().to_vec();
+        data.extend((0..size).map(|i| (i % 251) as u8));
+        data
+    }
+
+    async fn send_frame(
+        tx: &mpsc::Sender<Result<RecvMsg, ProtocolError>>,
+        group: u32,
+        seq: u32,
+    ) -> bool {
+        let encoder = raptorq::Encoder::with_defaults(&frame_bytes(seq), 1200);
+        let oti = encoder.get_config();
+        for packet in encoder.get_encoded_packets(2) {
+            let mut datagram = vec![0u8; 2];
+            datagram.extend(seq.to_be_bytes());
+            datagram.extend(group.to_be_bytes());
+            datagram.extend(oti.serialize());
+            datagram.extend(packet.serialize());
+            let msg = DatagramMsg::parse(Bytes::from(datagram)).unwrap();
+            if tx.send(Ok(RecvMsg::Datagram(msg))).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn send_config(
+        tx: &mpsc::Sender<Result<RecvMsg, ProtocolError>>,
+        group: u32,
+        seq: u32,
+    ) -> bool {
+        let packet = AVPacket::Media(MediaPacket {
+            header: MediaPacketHeader {
+                is_config: true,
+                is_key: true,
+                pts: u64::from(seq),
+                size: 0,
+            },
+            payload: Bytes::new(),
+        });
+        tx.send(Ok(RecvMsg::Stream(StreamMsg {
+            packet,
+            raw_kypacket_seq: seq,
+            raw_group_seq: group,
+        })))
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn delayed_config_stall_then_burst_recovers_within_pending_budget() {
+        // A keyframe request starts group 2. Its config waits on the reliable
+        // stream behind loss recovery while its frames keep arriving as valid
+        // FEC datagrams; then the config and a burst arrive together.
+        let (tx, rx) = mpsc::channel(16);
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        let stats = KyArc::new(KyMutex::new(ProtocolStats::default()));
+        let process = tokio::spawn(VideoUnreliableFecProtocolRecvDriver::process(
+            rx,
+            client_tx,
+            stats.clone(),
+        ));
+        let client = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            while let Some(Ok(AVPacket::Media(media))) = client_rx.recv().await {
+                forwarded.push((media.header.is_config, media.header.pts));
+            }
+            forwarded
+        });
+
+        let mut open = send_config(&tx, 1, 0).await;
+        for seq in 1..=4 {
+            open &= send_frame(&tx, 1, seq).await;
+        }
+        // The stall: 200 frames of group 2 over about 200 ms, without its config.
+        for seq in 6..=205 {
+            if !open {
+                break;
+            }
+            open &= send_frame(&tx, 2, seq).await;
+            if seq % 20 == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        // The burst: the delayed config, then 60 frames back to back.
+        open &= send_config(&tx, 2, 5).await;
+        for seq in 206..=265 {
+            if !open {
+                break;
+            }
+            open &= send_frame(&tx, 2, seq).await;
+        }
+        drop(tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), process)
+            .await
+            .expect("the receiver must not hang")
+            .unwrap();
+        let forwarded = client.await.unwrap();
+        assert!(
+            open,
+            "the receiver stopped reading during the stall: {result:?}"
+        );
+        result.expect("a stall with a delayed config must not end the stream");
+
+        // Config ordering and strictly increasing order are preserved.
+        let configs: Vec<u64> = forwarded.iter().filter(|f| f.0).map(|f| f.1).collect();
+        assert_eq!(configs, vec![0, 5]);
+        assert!(forwarded.windows(2).all(|pair| pair[0].1 < pair[1].1));
+        let after_config = forwarded.iter().position(|f| *f == (true, 5)).unwrap();
+        assert!(forwarded[..after_config].iter().all(|f| f.1 <= 4));
+        assert_eq!(
+            forwarded.last(),
+            Some(&(false, 265)),
+            "the stream recovered"
+        );
+
+        // Every kypacket was either forwarded or accounted as lost, and no more
+        // than the pending budget was ever held while the config was missing.
+        let dropped = stats.lock().dropped_packets.unwrap_or_default();
+        assert_eq!(forwarded.len() as u64 + dropped, 266);
+        let first_held = forwarded[after_config + 1].1;
+        assert!(dropped > 0 && first_held > 6);
+        assert!(265 - first_held + 1 < fec::MAX_PENDING_OBJECTS as u64 + 60);
     }
 }
+
+#[cfg(test)]
+#[path = "video_fec_validation_tests.rs"]
+mod validation_tests;
